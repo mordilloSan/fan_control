@@ -1,0 +1,78 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # The module uses kernel 7.0 APIs; build against the Ubuntu 26.04 kernel headers.
+    container: ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential linux-headers-generic dpkg-dev kmod
+
+      - name: Build the module (warnings are errors)
+        run: |
+          KDIR=$(ls -d /usr/src/linux-headers-*-generic | sort -V | tail -n 1)
+          make -C module KDIR="$KDIR" W=1 KCFLAGS=-Werror
+          /sbin/modinfo module/minisforum_ec.ko | grep -E '^(version|alias|license):'
+
+      - name: Package the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          V=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' module/dkms.conf)
+          if [ "v$V" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match dkms.conf version $V"
+            exit 1
+          fi
+          N=minisforum-ec-$V
+          mkdir -p dist pkg/DEBIAN pkg/usr/src/$N
+          cp module/minisforum_ec.c module/Kbuild module/Makefile module/dkms.conf pkg/usr/src/$N/
+
+          tar -C pkg/usr/src -czf dist/$N.tar.gz $N
+
+          cat > pkg/DEBIAN/control <<EOF
+          Package: minisforum-ec-dkms
+          Version: $V
+          Architecture: all
+          Section: kernel
+          Priority: optional
+          Depends: dkms
+          Maintainer: $GITHUB_REPOSITORY_OWNER <$GITHUB_REPOSITORY_OWNER@users.noreply.github.com>
+          Homepage: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY
+          Description: Minisforum UM760 Slim (F7BSI) fan control kernel module (DKMS)
+           Controls both fans of the Minisforum UM760 Slim through its embedded
+           controller, with temperature curves and hwmon/lm-sensors support.
+          EOF
+
+          printf '#!/bin/sh\nset -e\ndkms install minisforum-ec/%s\nmodprobe minisforum_ec || true\n' "$V" > pkg/DEBIAN/postinst
+          printf '#!/bin/sh\nset -e\nmodprobe -r minisforum_ec || true\ndkms remove minisforum-ec/%s --all || true\n' "$V" > pkg/DEBIAN/prerm
+          chmod -R u=rwX,go=rX pkg
+          chmod 755 pkg/DEBIAN/postinst pkg/DEBIAN/prerm
+
+          dpkg-deb --build --root-owner-group pkg dist/minisforum-ec-dkms_${V}_all.deb
+
+          # Release notes: this version's section of CHANGELOG.md
+          awk -v v="$V" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > dist/notes.md
+          test -s dist/notes.md
+          ls -l dist
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          body_path: dist/notes.md
+          files: |
+            dist/*.deb
+            dist/*.tar.gz

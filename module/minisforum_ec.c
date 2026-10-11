@@ -46,6 +46,10 @@
 
 #define DRVNAME			"minisforum_ec"
 
+#ifndef MEC_VERSION
+#error "MEC_VERSION comes from dkms.conf through Kbuild"
+#endif
+
 /* Super-I/O index/data ports: PawnIO LpcIO slot 0 (LpcIO.p:136-152). */
 #define SIO_INDEX		0x2e
 #define SIO_DATA		0x2f
@@ -2077,8 +2081,8 @@ static int mec_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	dev_info(dev, "CPU table %s (0x%02x); cpu fan %s, %d RPM; system fan %s, %d RPM\n",
-		 d->cpu_profile->name, d->cpu_profile->selector,
+	dev_info(dev, "v%s; CPU table %s (0x%02x); cpu fan %s, %d RPM; system fan %s, %d RPM\n",
+		 MEC_VERSION, d->cpu_profile->name, d->cpu_profile->selector,
 		 mode_names[d->fans[FAN_CPU].mode], t.rpm[0],
 		 mode_names[d->fans[FAN_SYS].mode], t.rpm[1]);
 	queue_delayed_work(system_dfl_wq, &d->monitor, 0);
@@ -2227,3 +2231,4 @@ module_exit(mec_exit);
 
 MODULE_DESCRIPTION("Minisforum UM760 Slim (F7BSI) EC fan monitor and control");
 MODULE_LICENSE("GPL");
+MODULE_VERSION(MEC_VERSION);

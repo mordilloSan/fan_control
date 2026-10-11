@@ -70,24 +70,29 @@ Each fan's mode (`pwm1` = CPU, `pwm2` = system) is set in `/sys/class/hwmon/hwmo
 
 ## Installation
 
-Requires Linux 6.17 or later.
+Requires Linux 6.17 or later. Each [release](https://github.com/mordilloSan/fan_control/releases) ships a DKMS
+package for Debian/Ubuntu and a source tarball; [CHANGELOG.md](CHANGELOG.md) lists the changes per version.
 
 ```sh
-sudo apt install git dkms build-essential lm-sensors linux-headers-$(uname -r)
-git clone https://github.com/mordilloSan/fan_control.git minisforum_ec
-cd minisforum_ec
-sudo dkms add ./module
-sudo dkms install minisforum-ec/0.3.0
-sudo modprobe minisforum_ec
+sudo apt install dkms build-essential lm-sensors linux-headers-$(uname -r)
+V=1.0.0
+curl -LO https://github.com/mordilloSan/fan_control/releases/download/v$V/minisforum-ec-dkms_${V}_all.deb
+sudo apt install ./minisforum-ec-dkms_${V}_all.deb
 sensors 'minisforum_ec-*'
 ```
 
-To uninstall:
+To upgrade, run the last two commands with the new version. To uninstall:
 
 ```sh
-sudo modprobe -r minisforum_ec
-sudo dkms remove minisforum-ec/0.3.0 --all
-sudo rm -r /usr/src/minisforum-ec-0.3.0
+sudo apt remove minisforum-ec-dkms
+```
+
+On other distributions, with `dkms` and the kernel headers installed:
+
+```sh
+V=1.0.0
+curl -L https://github.com/mordilloSan/fan_control/releases/download/v$V/minisforum-ec-$V.tar.gz | sudo tar xz -C /usr/src
+sudo dkms install minisforum-ec/$V
 ```
 
 The module loads automatically at boot on this board. Unloading it, suspend and shutdown all hand both fans back
