@@ -6,6 +6,7 @@ or limits, major for interface changes (module parameters, `pwmN`/`pwmN_enable` 
 
 ## [Unreleased]
 
+- Kernel log lines start with `minisforum_ec:` instead of `minisforum_ec minisforum_ec:`.
 - README: install the latest release from a fixed download link (`releases/latest/download/minisforum-ec-dkms.deb`),
   download to `/tmp`, and document the branch and release workflow.
 - CI: build `dev/**` branches; refuse a release tag that is not on `main`; publish the package also under the fixed

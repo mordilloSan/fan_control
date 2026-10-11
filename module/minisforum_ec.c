@@ -27,6 +27,9 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+/* pr_err() that also returns the error, where dev_err_probe() was. */
+#define mec_fail(err, fmt, ...)	({ pr_err(fmt, ##__VA_ARGS__); (err); })
+
 #include <linux/acpi.h>
 #include <linux/debugfs.h>
 #include <linux/delay.h>
@@ -714,10 +717,9 @@ static int mec_update(struct mec_data *d)
 
 	state = telemetry_sys_state(&t);
 	if (!d->fans[FAN_SYS].owned && state != SYS_FIRMWARE && !d->sys_state_warned) {
-		dev_warn(d->dev,
-			 "system fan left firmware control without this driver: effective 0x%02x, override 0x%02x, target %u (%s)\n",
-			 t.sys_effective, t.sys_override, t.sys_target,
-			 sys_state_names[state]);
+		pr_warn("system fan left firmware control without this driver: effective 0x%02x, override 0x%02x, target %u (%s)\n",
+			t.sys_effective, t.sys_override, t.sys_target,
+			sys_state_names[state]);
 		d->sys_state_warned = true;
 	}
 
@@ -857,8 +859,8 @@ static int mec_check_controller(struct device *dev)
 	for (i = 0; i < ARRAY_SIZE(pnp); i++)
 		pnp[i] = pnp_read(SIO_REG_CHIP_ID + i);
 	if (pnp[0] != 0x55 || pnp[1] != 0x71) {
-		dev_err(dev, "Super-I/O chip ID %*ph is not an IT5571; no EC memory access attempted\n",
-			(int)sizeof(pnp), pnp);
+		pr_err("Super-I/O chip ID %*ph is not an IT5571; no EC memory access attempted\n",
+		       (int)sizeof(pnp), pnp);
 		return -ENODEV;
 	}
 
@@ -870,8 +872,8 @@ static int mec_check_controller(struct device *dev)
 			return ret;
 	}
 	if (memcmp(ident, expected, sizeof(ident))) {
-		dev_err(dev, "controller signature %*ph does not match %*ph\n",
-			(int)sizeof(ident), ident, (int)sizeof(expected), expected);
+		pr_err("controller signature %*ph does not match %*ph\n",
+		       (int)sizeof(ident), ident, (int)sizeof(expected), expected);
 		return -ENODEV;
 	}
 	return 0;
@@ -904,12 +906,12 @@ static int check_sys_policy(struct device *dev)
 
 	ret = read_stable(read_sys_policy, &pol, &tmp, sizeof(pol));
 	if (ret) {
-		dev_err(dev, "system fan policy is not stable\n");
+		pr_err("system fan policy is not stable\n");
 		return ret;
 	}
 	if (memcmp(&pol, &f7bsi_sys_policy, sizeof(pol))) {
-		dev_err(dev, "system fan policy %*ph does not match f7bsi\n",
-			(int)sizeof(pol), &pol);
+		pr_err("system fan policy %*ph does not match f7bsi\n",
+		       (int)sizeof(pol), &pol);
 		return -EIO;
 	}
 	return 0;
@@ -981,8 +983,8 @@ static int xram_write_verified(struct mec_data *d,
 		if (ret)
 			return ret;
 		if (val != before[i].val) {
-			dev_err(dev, "EC precondition failed at 0x%04x: expected 0x%02x, read 0x%02x\n",
-				before[i].addr, before[i].val, val);
+			pr_err("EC precondition failed at 0x%04x: expected 0x%02x, read 0x%02x\n",
+			       before[i].addr, before[i].val, val);
 			return -EIO;
 		}
 	}
@@ -995,8 +997,8 @@ static int xram_write_verified(struct mec_data *d,
 		if (ret)
 			return ret;
 		if (val != writes[i].val) {
-			dev_err(dev, "EC verification failed at 0x%04x: wrote 0x%02x, read 0x%02x\n",
-				writes[i].addr, writes[i].val, val);
+			pr_err("EC verification failed at 0x%04x: wrote 0x%02x, read 0x%02x\n",
+			       writes[i].addr, writes[i].val, val);
 			return -EIO;
 		}
 	}
@@ -1020,8 +1022,8 @@ static int sys_wait_effective(struct device *dev, bool owned)
 		if (i + 1 < SYS_HANDOFF_POLLS)
 			msleep(SYS_HANDOFF_POLL_MS);
 	}
-	dev_err(dev, "system fan did not %s; effective byte ended at 0x%02x\n",
-		owned ? "enter fixed-target mode" : "return to firmware mode", last);
+	pr_err("system fan did not %s; effective byte ended at 0x%02x\n",
+	       owned ? "enter fixed-target mode" : "return to firmware mode", last);
 	return -EIO;
 }
 
@@ -1056,7 +1058,7 @@ static int sys_release_core(struct mec_data *d)
 			if (ret)
 				return ret;
 			if (sys_regs_state(&r) != SYS_FIRMWARE) {
-				dev_err(dev, "firmware did not resume system fan control\n");
+				pr_err("firmware did not resume system fan control\n");
 				return -EIO;
 			}
 			return 0;
@@ -1073,12 +1075,12 @@ static int sys_release_core(struct mec_data *d)
 			}
 			break;
 		default:
-			dev_err(dev, "system fan state is unsupported (effective 0x%02x, override 0x%02x, target %u); no recovery write attempted\n",
-				r.effective, r.override, r.target);
+			pr_err("system fan state is unsupported (effective 0x%02x, override 0x%02x, target %u); no recovery write attempted\n",
+			       r.effective, r.override, r.target);
 			return -EIO;
 		}
 	}
-	dev_err(dev, "system fan release did not reach firmware state\n");
+	pr_err("system fan release did not reach firmware state\n");
 	return -EIO;
 }
 
@@ -1108,8 +1110,8 @@ static int sys_engage(struct mec_data *d, struct fan *f, int rpm, int *start, bo
 		if (ret)
 			return ret;
 		if (sys_regs_state(&r) != SYS_FIRMWARE) {
-			dev_err(dev, "system fan is not under firmware control: effective 0x%02x, override 0x%02x, target %u\n",
-				r.effective, r.override, r.target);
+			pr_err("system fan is not under firmware control: effective 0x%02x, override 0x%02x, target %u\n",
+			       r.effective, r.override, r.target);
 			return -EIO;
 		}
 
@@ -1132,7 +1134,7 @@ static int sys_engage(struct mec_data *d, struct fan *f, int rpm, int *start, bo
 	if (ret)
 		return ret;
 	if (target > CODE_MAX) {
-		dev_err(dev, "system fan target %u after the handoff\n", target);
+		pr_err("system fan target %u after the handoff\n", target);
 		return -EIO;
 	}
 	*start = target;
@@ -1163,7 +1165,7 @@ static int sys_set(struct mec_data *d, struct fan *f, u8 code)
 	if (ret)
 		return ret;
 	if (r.effective != SYS_SENTINEL || r.override != SYS_SENTINEL || r.target != code) {
-		dev_err(dev, "fixed-target state not confirmed after writing %u\n", code);
+		pr_err("fixed-target state not confirmed after writing %u\n", code);
 		return -EIO;
 	}
 	return 0;
@@ -1214,7 +1216,7 @@ static int read_cpu_stable(struct device *dev, struct cpu_table *t)
 
 	ret = read_stable(read_cpu_table, t, &tmp, sizeof(*t));
 	if (ret)
-		dev_err(dev, "CPU fan table is not stable\n");
+		pr_err("CPU fan table is not stable\n");
 	return ret;
 }
 
@@ -1237,7 +1239,7 @@ static int cpu_engage(struct mec_data *d, struct fan *f, int rpm, int *start, bo
 	if (!problem && !cpu_is_canonical(&t, d->cpu_profile))
 		problem = "CPU table is not the canonical firmware table";
 	if (problem) {
-		dev_err(d->dev, "%s; CPU fan left to the firmware\n", problem);
+		pr_err("%s; CPU fan left to the firmware\n", problem);
 		return -EIO;
 	}
 
@@ -1266,7 +1268,7 @@ static int cpu_set(struct mec_data *d, struct fan *f, u8 code)
 	if (!problem && !cpu_is_fixed(&t, f->cur))
 		problem = "CPU table is not the state last written by this driver";
 	if (problem) {
-		dev_err(d->dev, "%s\n", problem);
+		pr_err("%s\n", problem);
 		return -EIO;
 	}
 
@@ -1292,13 +1294,13 @@ static int cpu_release(struct mec_data *d, struct fan *f)
 		return ret;
 	problem = check_cpu_static(&t, p);
 	if (problem) {
-		dev_err(d->dev, "%s; no CPU restore write attempted\n", problem);
+		pr_err("%s; no CPU restore write attempted\n", problem);
 		return -EIO;
 	}
 	if (cpu_is_canonical(&t, p))
 		return 0;
 	if (!cpu_recoverable(&t, p)) {
-		dev_err(d->dev, "CPU table is in a state this driver cannot produce; no restore write attempted\n");
+		pr_err("CPU table is in a state this driver cannot produce; no restore write attempted\n");
 		return -EIO;
 	}
 
@@ -1314,7 +1316,7 @@ static int cpu_release(struct mec_data *d, struct fan *f)
 	if (ret)
 		return ret;
 	if (check_cpu_static(&t, p) || !cpu_is_canonical(&t, p)) {
-		dev_err(d->dev, "the canonical CPU table was not restored\n");
+		pr_err("the canonical CPU table was not restored\n");
 		return -EIO;
 	}
 	return 0;
@@ -1357,8 +1359,8 @@ static int fan_release(struct mec_data *d, struct fan *f, const char *reason)
 		delay = MONITOR_JIFFIES << min(f->release_failures, RELEASE_RETRY_SHIFT);
 		f->release_failures++;
 		f->next_release = jiffies + delay;
-		dev_err(d->dev, "%s fan: returning it to firmware failed %u times (%d, %s); next retry in %lu s\n",
-			f->name, f->release_failures, ret, reason, delay / HZ);
+		pr_err("%s fan: returning it to firmware failed %u times (%d, %s); next retry in %lu s\n",
+		       f->name, f->release_failures, ret, reason, delay / HZ);
 		return ret;
 	}
 	f->release_failures = 0;
@@ -1366,7 +1368,7 @@ static int fan_release(struct mec_data *d, struct fan *f, const char *reason)
 	f->release_pending = false;
 	f->cur = -1;
 	f->win_n = 0;
-	dev_info(d->dev, "%s fan returned to firmware: %s\n", f->name, reason);
+	pr_info("%s fan returned to firmware: %s\n", f->name, reason);
 	return 0;
 }
 
@@ -1395,8 +1397,8 @@ static int fan_engage(struct mec_data *d, struct fan *f, int rpm)
 			 * back now. If that fails it is not this driver's to retry:
 			 * the next engage tries again after the hold.
 			 */
-			dev_info(d->dev, "%s fan left with the firmware: taking control failed\n",
-				 f->name);
+			pr_info("%s fan left with the firmware: taking control failed\n",
+				f->name);
 		}
 		return ret;
 	}
@@ -1405,8 +1407,8 @@ static int fan_engage(struct mec_data *d, struct fan *f, int rpm)
 	f->next_step = jiffies + STEP_JIFFIES;
 	f->settle_until = jiffies + SETTLE_JIFFIES;
 	f->win_n = 0;
-	dev_info(d->dev, "%s fan under driver control (%s), starting at %d RPM\n",
-		 f->name, mode_names[f->mode], start * 100);
+	pr_info("%s fan under driver control (%s), starting at %d RPM\n",
+		f->name, mode_names[f->mode], start * 100);
 	return 0;
 }
 
@@ -1453,11 +1455,11 @@ static int curve_goal(struct mec_data *d, struct fan *f, const struct curve *c, 
 		level--;
 	if (level != f->level) {
 		if (c->code[level] == CURVE_FIRMWARE)
-			dev_info(d->dev, "%s fan: %u C, curve point %u C: firmware\n",
-				 f->name, temp, c->temp[level]);
+			pr_info("%s fan: %u C, curve point %u C: firmware\n",
+				f->name, temp, c->temp[level]);
 		else
-			dev_info(d->dev, "%s fan: %u C, curve point %u C: %d RPM\n",
-				 f->name, temp, c->temp[level], c->code[level] * 100);
+			pr_info("%s fan: %u C, curve point %u C: %d RPM\n",
+				f->name, temp, c->temp[level], c->code[level] * 100);
 		f->level = level;
 	}
 	return c->code[level];
@@ -1485,14 +1487,14 @@ static void fan_check_hunting(struct mec_data *d, struct fan *f, int rpm)
 
 	f->hunts++;
 	f->last_hunt = jiffies;
-	dev_warn(d->dev, "%s fan hunting at %d RPM (measured %d..%d)\n",
-		 f->name, f->cur * 100, lo, hi);
+	pr_warn("%s fan hunting at %d RPM (measured %d..%d)\n",
+		f->name, f->cur * 100, lo, hi);
 	fan_release(d, f, "hunting");
 	if (f->hunts >= MAX_HUNTS) {
 		f->mode = MODE_FIRMWARE;
 		f->hunts = 0;
-		dev_warn(d->dev, "%s fan hunted %d times; left to the firmware until pwm%d_enable is set again\n",
-			 f->name, MAX_HUNTS, f->id + 1);
+		pr_warn("%s fan hunted %d times; left to the firmware until pwm%d_enable is set again\n",
+			f->name, MAX_HUNTS, f->id + 1);
 	} else {
 		fan_hold(f, HUNT_BACKOFF);
 	}
@@ -1514,17 +1516,17 @@ static void fan_tick(struct mec_data *d, struct fan *f, const struct curve *c,
 
 	if (!f->hot && (temp >= f->temp_limit || !plausible_temp(temp))) {
 		f->hot = true;
-		dev_warn(d->dev, "%s fan: EC temperature %u C, limit %u C\n",
-			 f->name, temp, f->temp_limit);
+		pr_warn("%s fan: EC temperature %u C, limit %u C\n",
+			f->name, temp, f->temp_limit);
 	} else if (f->hot && plausible_temp(temp) && temp + LIMIT_HYST < f->temp_limit) {
 		f->hot = false;
-		dev_info(d->dev, "%s fan: EC temperature back to %u C\n", f->name, temp);
+		pr_info("%s fan: EC temperature back to %u C\n", f->name, temp);
 	}
 
 	if (f->mode == MODE_MANUAL && time_after(jiffies, f->deadline)) {
 		f->mode = c->n ? MODE_CURVE : MODE_FIRMWARE;
-		dev_info(d->dev, "%s fan: no pwm%d write for %d s, back to %s\n",
-			 f->name, f->id + 1, WATCHDOG_SECONDS, mode_names[f->mode]);
+		pr_info("%s fan: no pwm%d write for %d s, back to %s\n",
+			f->name, f->id + 1, WATCHDOG_SECONDS, mode_names[f->mode]);
 	}
 	if (f->mode == MODE_CURVE && !c->n)
 		f->mode = MODE_FIRMWARE;
@@ -1559,8 +1561,8 @@ static void fan_tick(struct mec_data *d, struct fan *f, const struct curve *c,
 		} else if (++f->engage_failures >= MAX_ENGAGE_FAILURES) {
 			f->mode = MODE_FIRMWARE;
 			f->engage_failures = 0;
-			dev_warn(d->dev, "%s fan: taking control failed %d times; left to the firmware until pwm%d_enable is set again\n",
-				 f->name, MAX_ENGAGE_FAILURES, f->id + 1);
+			pr_warn("%s fan: taking control failed %d times; left to the firmware until pwm%d_enable is set again\n",
+				f->name, MAX_ENGAGE_FAILURES, f->id + 1);
 		} else {
 			fan_hold(f, HUNT_BACKOFF);
 		}
@@ -1568,7 +1570,7 @@ static void fan_tick(struct mec_data *d, struct fan *f, const struct curve *c,
 	}
 
 	if (!f->ops->held(d, f, t)) {
-		dev_err(d->dev, "%s fan: EC state changed under driver control\n", f->name);
+		pr_err("%s fan: EC state changed under driver control\n", f->name);
 		fan_release(d, f, "unexpected state");
 		fan_hold(f, HUNT_BACKOFF);
 		return;
@@ -1644,8 +1646,8 @@ static void mec_stop(struct mec_data *d, const char *reason)
 			msleep(200);
 		}
 		if (attempt == STOP_RELEASE_ATTEMPTS)
-			dev_crit(d->dev, "%s fan may still be under driver control; power the machine off completely before using the EC again\n",
-				 d->fans[i].name);
+			pr_crit("%s fan may still be under driver control; power the machine off completely before using the EC again\n",
+				d->fans[i].name);
 	}
 }
 
@@ -1774,7 +1776,7 @@ static int mec_write(struct device *dev, enum hwmon_sensor_types type,
 			return -EINVAL;
 		}
 		if (val != f->mode)
-			dev_info(d->dev, "%s fan: mode %s\n", f->name, mode_names[val]);
+			pr_info("%s fan: mode %s\n", f->name, mode_names[val]);
 		f->mode = val;
 		f->holding = false;
 		f->hunts = 0;
@@ -1954,16 +1956,16 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 
 	ret = read_stable(read_cpu_table, &cpu, &cpu_tmp, sizeof(cpu));
 	if (ret)
-		return dev_err_probe(dev, ret, "CPU fan table is not stable\n");
+		return mec_fail(ret, "CPU fan table is not stable\n");
 	p = find_cpu_profile(cpu.selector);
 	problem = check_cpu_static(&cpu, p);
 	if (problem)
-		return dev_err_probe(dev, -ENODEV, "%s (selector 0x%02x)\n",
-				     problem, cpu.selector);
+		return mec_fail(-ENODEV, "%s (selector 0x%02x)\n",
+				problem, cpu.selector);
 	cpu_repair = !cpu_is_canonical(&cpu, p);
 	if (cpu_repair && !cpu_recoverable(&cpu, p))
-		return dev_err_probe(dev, -ENODEV,
-				     "CPU table is neither canonical nor a state this driver can repair\n");
+		return mec_fail(-ENODEV,
+				"CPU table is neither canonical nor a state this driver can repair\n");
 	d->cpu_profile = p;
 
 	ret = check_sys_policy(dev);
@@ -1979,9 +1981,9 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 		return ret;
 	state = sys_regs_state(&r);
 	if (state == SYS_UNSUPPORTED)
-		return dev_err_probe(dev, -ENODEV,
-				     "system fan state is unsupported: effective 0x%02x, override 0x%02x, target %u\n",
-				     r.effective, r.override, r.target);
+		return mec_fail(-ENODEV,
+				"system fan state is unsupported: effective 0x%02x, override 0x%02x, target %u\n",
+				r.effective, r.override, r.target);
 
 	/*
 	 * Repair what an earlier session left (PawnIoF7bsdBackend.cs:84-99):
@@ -1992,23 +1994,23 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 	d->fans[FAN_SYS].owned = state != SYS_FIRMWARE;
 	d->fans[FAN_CPU].owned = cpu_repair;
 	if (state != SYS_FIRMWARE) {
-		dev_warn(dev, "system fan found in %s state (effective 0x%02x, override 0x%02x, target %u)\n",
-			 sys_state_names[state], r.effective, r.override, r.target);
+		pr_warn("system fan found in %s state (effective 0x%02x, override 0x%02x, target %u)\n",
+			sys_state_names[state], r.effective, r.override, r.target);
 		if (fan_release(d, &d->fans[FAN_SYS], "leftover from an earlier session"))
-			return dev_err_probe(dev, -EIO,
-					     "could not return the system fan to firmware; power the machine off completely\n");
+			return mec_fail(-EIO,
+					"could not return the system fan to firmware; power the machine off completely\n");
 		ret = read_sys_regs(&r);
 		if (ret)
 			return ret;
 		if (sys_regs_state(&r) != SYS_FIRMWARE)
-			return dev_err_probe(dev, -EIO,
-					     "system fan did not return to firmware control\n");
+			return mec_fail(-EIO,
+					"system fan did not return to firmware control\n");
 	}
 	if (cpu_repair) {
-		dev_warn(dev, "CPU table left by an earlier session; restoring it\n");
+		pr_warn("CPU table left by an earlier session; restoring it\n");
 		if (fan_release(d, &d->fans[FAN_CPU], "leftover from an earlier session"))
-			return dev_err_probe(dev, -EIO,
-					     "could not restore the CPU table; power the machine off completely\n");
+			return mec_fail(-EIO,
+					"could not restore the CPU table; power the machine off completely\n");
 	}
 	ret = check_sys_policy(dev);
 	if (ret)
@@ -2016,7 +2018,7 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 
 	ret = read_telemetry(t);
 	if (ret)
-		return dev_err_probe(dev, ret, "telemetry read failed\n");
+		return mec_fail(ret, "telemetry read failed\n");
 	return 0;
 }
 
@@ -2035,11 +2037,11 @@ static int mec_probe(struct platform_device *pdev)
 	int i, ret;
 
 	if (acpi_check_region(SIO_INDEX, 2, DRVNAME))
-		return dev_err_probe(dev, -EBUSY,
-				     "ACPI declares an operation region over ports 0x2e-0x2f\n");
+		return mec_fail(-EBUSY,
+				"ACPI declares an operation region over ports 0x2e-0x2f\n");
 	/* Exclusive (not muxed): other Super-I/O drivers get -EBUSY. */
 	if (!devm_request_region(dev, SIO_INDEX, 2, DRVNAME))
-		return dev_err_probe(dev, -EBUSY, "ports 0x2e-0x2f are already in use\n");
+		return mec_fail(-EBUSY, "ports 0x2e-0x2f are already in use\n");
 
 	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
 	if (!d)
@@ -2081,10 +2083,10 @@ static int mec_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	dev_info(dev, "v%s; CPU table %s (0x%02x); cpu fan %s, %d RPM; system fan %s, %d RPM\n",
-		 MEC_VERSION, d->cpu_profile->name, d->cpu_profile->selector,
-		 mode_names[d->fans[FAN_CPU].mode], t.rpm[0],
-		 mode_names[d->fans[FAN_SYS].mode], t.rpm[1]);
+	pr_info("v%s; CPU table %s (0x%02x); cpu fan %s, %d RPM; system fan %s, %d RPM\n",
+		MEC_VERSION, d->cpu_profile->name, d->cpu_profile->selector,
+		mode_names[d->fans[FAN_CPU].mode], t.rpm[0],
+		mode_names[d->fans[FAN_SYS].mode], t.rpm[1]);
 	queue_delayed_work(system_dfl_wq, &d->monitor, 0);
 	return 0;
 }
