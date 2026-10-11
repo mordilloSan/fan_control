@@ -75,13 +75,14 @@ package for Debian/Ubuntu and a source tarball; [CHANGELOG.md](CHANGELOG.md) lis
 
 ```sh
 sudo apt install dkms build-essential lm-sensors linux-headers-$(uname -r)
-V=1.0.0
-curl -LO https://github.com/mordilloSan/fan_control/releases/download/v$V/minisforum-ec-dkms_${V}_all.deb
-sudo apt install ./minisforum-ec-dkms_${V}_all.deb
+cd /tmp
+curl -LO https://github.com/mordilloSan/fan_control/releases/latest/download/minisforum-ec-dkms.deb
+sudo apt install ./minisforum-ec-dkms.deb
 sensors 'minisforum_ec-*'
 ```
 
-To upgrade, run the last two commands with the new version. To uninstall:
+This always installs the latest release. To upgrade, run the same commands again. For a specific version, download
+`releases/download/vX.Y.Z/minisforum-ec-dkms_X.Y.Z_all.deb` instead. To uninstall:
 
 ```sh
 sudo apt remove minisforum-ec-dkms
@@ -90,7 +91,7 @@ sudo apt remove minisforum-ec-dkms
 On other distributions, with `dkms` and the kernel headers installed:
 
 ```sh
-V=1.0.0
+V=$(curl -s https://api.github.com/repos/mordilloSan/fan_control/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
 curl -L https://github.com/mordilloSan/fan_control/releases/download/v$V/minisforum-ec-$V.tar.gz | sudo tar xz -C /usr/src
 sudo dkms install minisforum-ec/$V
 ```
@@ -125,6 +126,24 @@ At the next boot the blue MOK Manager screen appears. Press a key within 10 seco
 
 Until the key is enrolled, the kernel refuses to load the module (`Key was rejected by service`) and the fans stay
 under firmware control.
+
+## Development
+
+- `main` only holds released code. Each release is an annotated tag `vX.Y.Z` on `main`.
+- Work for the next version happens on a `dev/vX.Y.Z` branch and reaches `main` through a pull request.
+- CI builds the module against the Ubuntu 26.04 kernel headers, with warnings as errors, on every push to `main`
+  and `dev/**` and on every pull request.
+- To release: on the dev branch, set `PACKAGE_VERSION` in `module/dkms.conf` and move the `Unreleased` entries in
+  [CHANGELOG.md](CHANGELOG.md) under the new version. Merge into `main`, then tag and push:
+
+  ```sh
+  git tag -a vX.Y.Z -m "minisforum-ec X.Y.Z" && git push origin vX.Y.Z
+  ```
+
+  CI checks that the tag matches `dkms.conf` and is on `main`, then publishes the release with the DKMS package
+  and the source tarball.
+- Versions follow [Semantic Versioning](https://semver.org/): patch for fixes, minor for behaviour changes
+  (default curves, limits), major for interface changes (module parameters, `pwmN` and `pwmN_enable`).
 
 ## License
 
