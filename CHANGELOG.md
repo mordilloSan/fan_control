@@ -4,7 +4,7 @@ All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org/): patch for fixes, minor for behaviour changes such as default curves
 or limits, major for interface changes (module parameters, `pwmN`/`pwmN_enable` meaning).
 
-## [Unreleased]
+## [1.1.0] - 2026-10-11
 
 - Kernel log lines start with `minisforum_ec:` instead of `minisforum_ec minisforum_ec:`.
 - README: install the latest release from a fixed download link (`releases/latest/download/minisforum-ec-dkms.deb`),
