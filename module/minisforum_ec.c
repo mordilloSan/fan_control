@@ -5,8 +5,7 @@
  *
  * The register map, admission rules and I2EC access sequence come from the
  * "f7bsi" profile of FanControl.MinisforumUM (github.com/zuyan9), commit
- * d61e46c. File:line references point into that repository; docs/fase0.md in
- * this project summarises them.
+ * d61e46c. File:line references point into that repository.
  *
  * Each fan (pwm1 CPU, pwm2 system) runs in one of three modes: a fixed value
  * written by userspace, this driver's temperature curve (module parameters
@@ -18,10 +17,12 @@
  * critical row. Every write checks its preconditions first and is read back.
  *
  * The driver moves a fan one code at a time, because a jump makes the EC's
- * speed loop hunt, and gives the fan back to the firmware when its EC
- * temperature reaches its limit, when it hunts, when a fixed value is not
- * renewed for WATCHDOG_SECONDS (back to the curve), on unload, sleep and
- * shutdown.
+ * speed loop hunt; a stopped fan restarts at SPINUP_CODE and steps down. It
+ * gives the fan back to the firmware at a curve's firmware point, in mode 3,
+ * when its EC temperature reaches its limit or reads implausibly, when it
+ * hunts, when the EC is not in the state it last wrote, when a write or the
+ * telemetry fails, on unload, sleep and shutdown. A fixed value that is not
+ * renewed for WATCHDOG_SECONDS falls back to the curve.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -78,6 +79,7 @@
 
 #define CPU_ROWS		7	/* normal rows; the critical row follows */
 #define CODE_MAX		51	/* F7bsdProfile.cs:28 */
+#define PWM_PER_CODE		5	/* hwmon pwmN 0..255 is CODE_MAX * 5 */
 #define SYS_SENTINEL		0xff	/* F7bsdProfile.cs:29 */
 #define STABLE_ATTEMPTS		4	/* PawnIoF7bsdBackend.cs:5 */
 #define TACH_ATTEMPTS		3	/* PawnIoF7bsdBackend.cs:603 */
@@ -94,8 +96,8 @@
 #define CPU_TEMP_LIMIT		80	/* EC CPU temperature handing pwm1 to firmware */
 #define LIMIT_HYST		5	/* ... until it falls this far below the limit */
 #define CURVE_HYST		3	/* degrees below a curve point before leaving it */
-#define SYS_MIN_CODE		8	/* codes 1..7 make the system fan hunt (docs/fase2.md) */
-#define CPU_MIN_CODE		6	/* code 5 made the CPU fan hunt (docs/fase3.md) */
+#define SYS_MIN_CODE		8	/* codes 1..7 made the system fan hunt (measured) */
+#define CPU_MIN_CODE		6	/* code 5 made the CPU fan hunt (measured) */
 #define SPINUP_CODE		20	/* a stopped fan restarts here and steps down */
 #define MONITOR_JIFFIES		(2 * HZ)
 #define STEP_JIFFIES		(4 * HZ)	/* at most one code per step */
@@ -106,6 +108,9 @@
 #define HUNT_FORGET		(30 * 60 * HZ)
 #define SETTLE_JIFFIES		(10 * HZ)	/* after a write, before hunting is judged */
 #define MAX_READ_FAILURES	3	/* consecutive telemetry failures before letting go */
+#define MAX_ENGAGE_FAILURES	3	/* consecutive failed engages before mode 3 */
+#define RELEASE_RETRY_SHIFT	7U	/* failed releases retry after 2 s, 4 s, ... 256 s */
+#define RESUME_SETTLE_JIFFIES	(5 * HZ)	/* the EC reads zeros for a moment after waking */
 
 /* Controller signature, compared with the PNP bytes (F7bsdProfile.cs:34-35). */
 static const u16 ec_ident_addrs[] = { 0x2000, 0x2001, 0x2002, 0x200d, 0x180c, 0x1841 };
@@ -500,9 +505,10 @@ static const char * const mode_names[] = {
 
 /*
  * A curve is a list of temp:code points in ascending temperature. The point
- * in force is the last one whose temperature has been reached; going down, a
- * point is left only CURVE_HYST degrees below it. CURVE_FIRMWARE hands the fan
- * to the firmware.
+ * in force is the last one whose temperature has been reached (the first
+ * point below that); going down, a point is left once the temperature is more
+ * than CURVE_HYST degrees below it. CURVE_FIRMWARE hands the fan to the
+ * firmware.
  */
 struct curve {
 	int n;
@@ -567,6 +573,9 @@ static int curve_parse(const char *val, const struct curve_param *cp, struct cur
 			if (kstrtouint(v, 10, &rpm) || rpm > CODE_MAX * 100)
 				return -EINVAL;
 			code = DIV_ROUND_CLOSEST(rpm, 100);
+			/* 1..49 would round to a stop: refuse it rather than stop the fan. */
+			if (rpm && !code)
+				return -EINVAL;
 			if (code > 0 && code < cp->min_code)
 				return -EINVAL;
 		}
@@ -624,14 +633,17 @@ MODULE_PARM_DESC(cpu_curve,
 		 "CPU fan curve on the EC CPU temperature, default \"0:0,25:1000,45:1400,54:1800,66:firmware\"; empty leaves the fan to the firmware; rpm 0 or 600..5100");
 module_param_cb(system_curve, &curve_ops, &curve_params[FAN_SYS], 0644);
 MODULE_PARM_DESC(system_curve,
-		 "System fan curve on the EC system temperature, default \"0:0,25:1000,40:1600,50:firmware\"; rpm 0 or 800..5100");
+		 "System fan curve on the EC system temperature, default \"0:0,25:1000,40:1600,50:firmware\"; empty leaves the fan to the firmware; rpm 0 or 800..5100");
 
 struct mec_data;
 struct fan;
 
 struct fan_ops {
-	/* Take the fan from the firmware; *start is the code then in force. */
-	int (*engage)(struct mec_data *d, struct fan *f, int rpm, int *start);
+	/*
+	 * Take the fan from the firmware; *start is the code then in force.
+	 * *issued is set once a write may have reached the EC, even on failure.
+	 */
+	int (*engage)(struct mec_data *d, struct fan *f, int rpm, int *start, bool *issued);
 	int (*set)(struct mec_data *d, struct fan *f, u8 code);
 	/* Give the fan back to the firmware and verify that it has it. */
 	int (*release)(struct mec_data *d, struct fan *f);
@@ -663,6 +675,9 @@ struct fan {
 	unsigned long last_hunt;
 	int rpm_win[HUNT_WINDOW];
 	int win_n;
+	int engage_failures;		/* consecutive failed engages */
+	unsigned int release_failures;	/* consecutive failed releases */
+	unsigned long next_release;	/* a pending release is retried from here */
 };
 
 struct mec_data {
@@ -824,7 +839,10 @@ static bool cpu_recoverable(const struct cpu_table *t, const struct cpu_profile 
 	       update_or_restore_prefix(bases, p->bases);
 }
 
-/* PNP and controller signatures, at load and before every write (PawnIoNative.cs:62-88). */
+/*
+ * PNP and controller signatures (PawnIoNative.cs:62-88). The plugin checks
+ * them once when it opens the port; this driver also checks before every write.
+ */
 static int mec_check_controller(struct device *dev)
 {
 	u8 pnp[3], ident[ARRAY_SIZE(ec_ident_addrs)];
@@ -930,11 +948,14 @@ static bool xram_writable(const struct mec_data *d, u16 addr, u8 val)
 
 /*
  * Check the controller signature and every precondition, then write each
- * byte and read it back (PawnIoNative.cs:125-157).
+ * byte and read it back (PawnIoNative.cs:125-157). *issued, if given, is set
+ * just before the first write, like the plugin's beforeWrites callback: from
+ * there on a failure may leave the EC following this driver.
  */
 static int xram_write_verified(struct mec_data *d,
 			       const struct ec_byte *before, size_t n_before,
-			       const struct ec_byte *writes, size_t n_writes)
+			       const struct ec_byte *writes, size_t n_writes,
+			       bool *issued)
 {
 	struct device *dev = d->dev;
 	size_t i;
@@ -962,6 +983,8 @@ static int xram_write_verified(struct mec_data *d,
 		}
 	}
 
+	if (issued)
+		*issued = true;
 	for (i = 0; i < n_writes; i++) {
 		i2ec_write(writes[i].addr, writes[i].val);
 		ret = xram_read(writes[i].addr, &val);
@@ -1040,7 +1063,7 @@ static int sys_release_core(struct mec_data *d)
 				write = (struct ec_byte){ EC_SYS_OVERRIDE, 0 };
 			else
 				write = (struct ec_byte){ EC_SYS_TARGET, CODE_MAX };
-			if (xram_write_verified(d, before, ARRAY_SIZE(before), &write, 1)) {
+			if (xram_write_verified(d, before, ARRAY_SIZE(before), &write, 1, NULL)) {
 				write_failed = true;
 				failed = r;
 			}
@@ -1055,39 +1078,61 @@ static int sys_release_core(struct mec_data *d)
 	return -EIO;
 }
 
-/* Set the override, keeping the firmware's target (PawnIoF7bsdBackend.cs:392-415). */
-static int sys_engage(struct mec_data *d, struct fan *f, int rpm, int *start)
+/*
+ * Set the override, keeping the firmware's target (PawnIoF7bsdBackend.cs:392-415).
+ * In firmware mode the effective byte follows a temperature and the target
+ * follows the firmware's bands, so a precondition that fails before any write
+ * is tried once more. The code in force is read back once the firmware has let
+ * go of the target.
+ */
+static int sys_engage(struct mec_data *d, struct fan *f, int rpm, int *start, bool *issued)
 {
 	struct device *dev = d->dev;
 	struct ec_byte before[SYS_POLICY_BYTES + 3];
 	struct ec_byte write = { EC_SYS_OVERRIDE, SYS_SENTINEL };
 	struct sys_regs r;
+	int attempt, ret;
 	size_t n;
-	int ret;
+	u8 target;
 
 	ret = check_sys_policy(dev);
 	if (ret)
 		return ret;
-	ret = read_sys_regs(&r);
+
+	for (attempt = 0; attempt < 2; attempt++) {
+		ret = read_sys_regs(&r);
+		if (ret)
+			return ret;
+		if (sys_regs_state(&r) != SYS_FIRMWARE) {
+			dev_err(dev, "system fan is not under firmware control: effective 0x%02x, override 0x%02x, target %u\n",
+				r.effective, r.override, r.target);
+			return -EIO;
+		}
+
+		n = sys_policy_expectations(before);
+		before[n++] = (struct ec_byte){ EC_SYS_EFFECTIVE, r.effective };
+		before[n++] = (struct ec_byte){ EC_SYS_OVERRIDE, r.override };
+		before[n++] = (struct ec_byte){ EC_SYS_TARGET, r.target };
+
+		ret = xram_write_verified(d, before, n, &write, 1, issued);
+		if (!ret || *issued)
+			break;
+	}
 	if (ret)
 		return ret;
-	if (sys_regs_state(&r) != SYS_FIRMWARE) {
-		dev_err(dev, "system fan is not under firmware control: effective 0x%02x, override 0x%02x, target %u\n",
-			r.effective, r.override, r.target);
+
+	ret = sys_wait_effective(dev, true);
+	if (ret)
+		return ret;
+	ret = xram_read(EC_SYS_TARGET, &target);
+	if (ret)
+		return ret;
+	if (target > CODE_MAX) {
+		dev_err(dev, "system fan target %u after the handoff\n", target);
 		return -EIO;
 	}
-
-	n = sys_policy_expectations(before);
-	before[n++] = (struct ec_byte){ EC_SYS_EFFECTIVE, r.effective };
-	before[n++] = (struct ec_byte){ EC_SYS_OVERRIDE, r.override };
-	before[n++] = (struct ec_byte){ EC_SYS_TARGET, r.target };
-
-	ret = xram_write_verified(d, before, n, &write, 1);
-	if (!ret)
-		ret = sys_wait_effective(dev, true);
-	if (!ret)
-		*start = r.target;
-	return ret;
+	*start = target;
+	return 0;
 }
 
 /* PawnIoF7bsdBackend.cs:316-390 */
@@ -1107,7 +1152,7 @@ static int sys_set(struct mec_data *d, struct fan *f, u8 code)
 	before[n++] = (struct ec_byte){ EC_SYS_EFFECTIVE, SYS_SENTINEL };
 	before[n++] = (struct ec_byte){ EC_SYS_OVERRIDE, SYS_SENTINEL };
 	before[n++] = (struct ec_byte){ EC_SYS_TARGET, f->cur };
-	ret = xram_write_verified(d, before, n, &write, 1);
+	ret = xram_write_verified(d, before, n, &write, 1, NULL);
 	if (ret)
 		return ret;
 	ret = read_sys_regs(&r);
@@ -1170,7 +1215,7 @@ static int read_cpu_stable(struct device *dev, struct cpu_table *t)
 }
 
 /* Slopes to zero, then every base to the code (F7bsdProfile.cs:306-317). */
-static int cpu_engage(struct mec_data *d, struct fan *f, int rpm, int *start)
+static int cpu_engage(struct mec_data *d, struct fan *f, int rpm, int *start, bool *issued)
 {
 	struct ec_byte before[CPU_SNAPSHOT_BYTES], writes[2 * CPU_ROWS];
 	struct cpu_table t;
@@ -1196,7 +1241,7 @@ static int cpu_engage(struct mec_data *d, struct fan *f, int rpm, int *start)
 		writes[n++] = (struct ec_byte){ EC_CPU_SLOPES + r, 0 };
 	for (r = 0; r < CPU_ROWS; r++)
 		writes[n++] = (struct ec_byte){ EC_CPU_ROWS + 3 * r, code };
-	ret = xram_write_verified(d, before, cpu_expectations(&t, before), writes, n);
+	ret = xram_write_verified(d, before, cpu_expectations(&t, before), writes, n, issued);
 	if (!ret)
 		*start = code;
 	return ret;
@@ -1223,7 +1268,7 @@ static int cpu_set(struct mec_data *d, struct fan *f, u8 code)
 
 	for (r = 0; r < CPU_ROWS; r++)
 		writes[r] = (struct ec_byte){ EC_CPU_ROWS + 3 * r, code };
-	return xram_write_verified(d, before, cpu_expectations(&t, before), writes, CPU_ROWS);
+	return xram_write_verified(d, before, cpu_expectations(&t, before), writes, CPU_ROWS, NULL);
 }
 
 /*
@@ -1259,7 +1304,7 @@ static int cpu_release(struct mec_data *d, struct fan *f)
 		writes[n++] = (struct ec_byte){ EC_CPU_ROWS + 3 * r, p->bases[r] };
 	for (r = 0; r < CPU_ROWS; r++)
 		writes[n++] = (struct ec_byte){ EC_CPU_SLOPES + r, p->slopes[r] };
-	xram_write_verified(d, before, cpu_expectations(&t, before), writes, n);
+	xram_write_verified(d, before, cpu_expectations(&t, before), writes, n, NULL);
 
 	ret = read_cpu_stable(d->dev, &t);
 	if (ret)
@@ -1271,12 +1316,17 @@ static int cpu_release(struct mec_data *d, struct fan *f)
 	return 0;
 }
 
+/* A mismatch is read once more before it counts: one bad snapshot is not trusted. */
 static bool cpu_held(struct mec_data *d, struct fan *f, const struct telemetry *unused)
 {
 	struct cpu_table t;
+	int attempt;
 
-	return !read_cpu_table(&t) && !check_cpu_static(&t, d->cpu_profile) &&
-	       cpu_is_fixed(&t, f->cur);
+	for (attempt = 0; attempt < 2; attempt++)
+		if (!read_cpu_table(&t) && !check_cpu_static(&t, d->cpu_profile) &&
+		    cpu_is_fixed(&t, f->cur))
+			return true;
+	return false;
 }
 
 static const struct fan_ops cpu_fan_ops = {
@@ -1290,6 +1340,7 @@ static const struct fan_ops cpu_fan_ops = {
 
 static int fan_release(struct mec_data *d, struct fan *f, const char *reason)
 {
+	unsigned long delay;
 	int ret;
 
 	if (!f->owned && !f->release_pending)
@@ -1298,10 +1349,15 @@ static int fan_release(struct mec_data *d, struct fan *f, const char *reason)
 	d->valid = false;
 	ret = f->ops->release(d, f);
 	if (ret) {
-		dev_err_ratelimited(d->dev, "%s fan: returning it to firmware failed (%d, %s); will retry\n",
-				    f->name, ret, reason);
+		/* Back off, so that an EC state that cannot be released does not flood the log. */
+		delay = MONITOR_JIFFIES << min(f->release_failures, RELEASE_RETRY_SHIFT);
+		f->release_failures++;
+		f->next_release = jiffies + delay;
+		dev_err(d->dev, "%s fan: returning it to firmware failed %u times (%d, %s); next retry in %lu s\n",
+			f->name, f->release_failures, ret, reason, delay / HZ);
 		return ret;
 	}
+	f->release_failures = 0;
 	f->owned = false;
 	f->release_pending = false;
 	f->cur = -1;
@@ -1318,18 +1374,29 @@ static void fan_hold(struct fan *f, unsigned long duration)
 
 static int fan_engage(struct mec_data *d, struct fan *f, int rpm)
 {
+	bool issued = false;
 	int start = 0, ret;
 
-	/* From here the EC may follow this driver, so any failure must release. */
-	f->owned = true;
-	f->release_pending = true;
 	d->valid = false;
-	ret = f->ops->engage(d, f, rpm, &start);
+	ret = f->ops->engage(d, f, rpm, &start, &issued);
 	if (ret) {
-		fan_release(d, f, "taking control failed");
+		if (issued) {
+			/* A write may have reached the EC: release until that succeeds. */
+			f->owned = true;
+			fan_release(d, f, "taking control failed");
+		} else if (!f->ops->release(d, f)) {
+			/*
+			 * Nothing was written, but a state another EC writer left
+			 * (a repairable CPU table, a fixed-target handoff) is handed
+			 * back now. If that fails it is not this driver's to retry:
+			 * the next engage tries again after the hold.
+			 */
+			dev_info(d->dev, "%s fan left with the firmware: taking control failed\n",
+				 f->name);
+		}
 		return ret;
 	}
-	f->release_pending = false;
+	f->owned = true;
 	f->cur = start;
 	f->next_step = jiffies + STEP_JIFFIES;
 	f->settle_until = jiffies + SETTLE_JIFFIES;
@@ -1436,7 +1503,8 @@ static void fan_tick(struct mec_data *d, struct fan *f, const struct curve *c,
 	int goal;
 
 	if (f->release_pending) {
-		fan_release(d, f, "retry");
+		if (!time_before(jiffies, f->next_release))
+			fan_release(d, f, "retry");
 		return;
 	}
 
@@ -1482,8 +1550,16 @@ static void fan_tick(struct mec_data *d, struct fan *f, const struct curve *c,
 	}
 
 	if (!f->owned) {
-		if (fan_engage(d, f, rpm))
+		if (!fan_engage(d, f, rpm)) {
+			f->engage_failures = 0;
+		} else if (++f->engage_failures >= MAX_ENGAGE_FAILURES) {
+			f->mode = MODE_FIRMWARE;
+			f->engage_failures = 0;
+			dev_warn(d->dev, "%s fan: taking control failed %d times; left to the firmware until pwm%d_enable is set again\n",
+				 f->name, MAX_ENGAGE_FAILURES, f->id + 1);
+		} else {
 			fan_hold(f, HUNT_BACKOFF);
+		}
 		return;
 	}
 
@@ -1533,9 +1609,13 @@ static void mec_monitor(struct work_struct *work)
 	} else if (++d->read_failures >= MAX_READ_FAILURES) {
 		/* Without temperatures and RPM nothing can be judged: let the firmware decide. */
 		for (i = 0; i < NR_FANS; i++) {
-			if (d->fans[i].owned || d->fans[i].release_pending) {
-				fan_release(d, &d->fans[i], "EC telemetry unreadable");
-				fan_hold(&d->fans[i], HUNT_BACKOFF);
+			struct fan *f = &d->fans[i];
+
+			if (f->release_pending && time_before(jiffies, f->next_release))
+				continue;
+			if (f->owned || f->release_pending) {
+				fan_release(d, f, "EC telemetry unreadable");
+				fan_hold(f, HUNT_BACKOFF);
 			}
 		}
 	}
@@ -1601,11 +1681,11 @@ static int mec_read(struct device *dev, enum hwmon_sensor_types type,
 		f = &d->fans[channel];
 		switch (attr) {
 		case hwmon_pwm_input:
-			/* EC target code 0..51, nominally code * 100 RPM. */
+			/* EC target code 0..51 (nominally code * 100 RPM), as hwmon's 0..255. */
 			if (f->owned && f->cur >= 0)
-				*val = f->cur;
+				*val = f->cur * PWM_PER_CODE;
 			else if (channel == FAN_SYS)
-				*val = d->t.sys_target;
+				*val = min_t(int, d->t.sys_target, CODE_MAX) * PWM_PER_CODE;
 			else
 				return -ENODATA;
 			return 0;
@@ -1629,8 +1709,9 @@ static bool code_valid(const struct fan *f, long val)
 
 /*
  * pwmN_enable: 1 fixed value (starting at the current speed), 2 curve,
- * 3 firmware. pwmN: the fixed value, accepted in mode 1 only; each write
- * restarts the watchdog, after which the fan returns to its curve.
+ * 3 firmware. pwmN: the fixed value, 0..255 in steps of PWM_PER_CODE (one EC
+ * code), accepted in mode 1 only; each write restarts the watchdog, after
+ * which the fan returns to its curve.
  */
 static int mec_write(struct device *dev, enum hwmon_sensor_types type,
 		     u32 attr, int channel, long val)
@@ -1657,9 +1738,13 @@ static int mec_write(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_pwm_input:
 		if (f->mode != MODE_MANUAL)
 			return -EBUSY;
-		if (!code_valid(f, val))
+		if (val < 0 || val > CODE_MAX * PWM_PER_CODE)
 			return -EINVAL;
-		f->manual_code = val;
+		code = DIV_ROUND_CLOSEST(val, PWM_PER_CODE);
+		/* 1..2 would round to a stop: refuse it rather than stop the fan. */
+		if ((val && !code) || !code_valid(f, code))
+			return -EINVAL;
+		f->manual_code = code;
 		break;
 	case hwmon_pwm_enable:
 		if (val == MODE_MANUAL) {
@@ -1689,6 +1774,8 @@ static int mec_write(struct device *dev, enum hwmon_sensor_types type,
 		f->mode = val;
 		f->holding = false;
 		f->hunts = 0;
+		f->engage_failures = 0;
+		f->next_release = jiffies;	/* a pending release is retried now */
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -1849,6 +1936,7 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 	struct cpu_table cpu, cpu_tmp;
 	const struct cpu_profile *p;
 	enum sys_state state;
+	struct sys_regs r;
 	const char *problem;
 	bool cpu_repair;
 	int ret;
@@ -1878,41 +1966,53 @@ static int mec_admit(struct mec_data *d, struct telemetry *t)
 	if (ret)
 		return -ENODEV;
 
-	ret = read_telemetry(t);
+	/*
+	 * Only the three state bytes (PawnIoF7bsdBackend.cs:74): a tachometer
+	 * glitch must not keep a leftover from being repaired.
+	 */
+	ret = read_sys_regs(&r);
 	if (ret)
-		return dev_err_probe(dev, ret, "telemetry read failed\n");
-	state = telemetry_sys_state(t);
+		return ret;
+	state = sys_regs_state(&r);
 	if (state == SYS_UNSUPPORTED)
 		return dev_err_probe(dev, -ENODEV,
 				     "system fan state is unsupported: effective 0x%02x, override 0x%02x, target %u\n",
-				     t->sys_effective, t->sys_override, t->sys_target);
+				     r.effective, r.override, r.target);
 
-	/* Repair what an earlier session left (PawnIoF7bsdBackend.cs:84-115). */
+	/*
+	 * Repair what an earlier session left (PawnIoF7bsdBackend.cs:84-99):
+	 * every leftover is marked first, so that a failed repair still has the
+	 * rest released on the way out, and the system fan goes first because
+	 * the firmware has no temperature fallback while it is in the handoff.
+	 */
+	d->fans[FAN_SYS].owned = state != SYS_FIRMWARE;
+	d->fans[FAN_CPU].owned = cpu_repair;
+	if (state != SYS_FIRMWARE) {
+		dev_warn(dev, "system fan found in %s state (effective 0x%02x, override 0x%02x, target %u)\n",
+			 sys_state_names[state], r.effective, r.override, r.target);
+		if (fan_release(d, &d->fans[FAN_SYS], "leftover from an earlier session"))
+			return dev_err_probe(dev, -EIO,
+					     "could not return the system fan to firmware; power the machine off completely\n");
+		ret = read_sys_regs(&r);
+		if (ret)
+			return ret;
+		if (sys_regs_state(&r) != SYS_FIRMWARE)
+			return dev_err_probe(dev, -EIO,
+					     "system fan did not return to firmware control\n");
+	}
 	if (cpu_repair) {
 		dev_warn(dev, "CPU table left by an earlier session; restoring it\n");
-		d->fans[FAN_CPU].owned = true;
 		if (fan_release(d, &d->fans[FAN_CPU], "leftover from an earlier session"))
 			return dev_err_probe(dev, -EIO,
 					     "could not restore the CPU table; power the machine off completely\n");
 	}
-	if (state != SYS_FIRMWARE) {
-		dev_warn(dev, "system fan found in %s state (effective 0x%02x, override 0x%02x, target %u)\n",
-			 sys_state_names[state], t->sys_effective, t->sys_override,
-			 t->sys_target);
-		d->fans[FAN_SYS].owned = true;
-		if (fan_release(d, &d->fans[FAN_SYS], "leftover from an earlier session"))
-			return dev_err_probe(dev, -EIO,
-					     "could not return the system fan to firmware; power the machine off completely\n");
-		ret = read_telemetry(t);
-		if (ret)
-			return ret;
-		if (telemetry_sys_state(t) != SYS_FIRMWARE)
-			return dev_err_probe(dev, -EIO,
-					     "system fan did not return to firmware control\n");
-	}
 	ret = check_sys_policy(dev);
 	if (ret)
 		return -ENODEV;
+
+	ret = read_telemetry(t);
+	if (ret)
+		return dev_err_probe(dev, ret, "telemetry read failed\n");
 	return 0;
 }
 
@@ -1987,7 +2087,8 @@ static int mec_probe(struct platform_device *pdev)
 
 /*
  * System sleep (suspend, hibernate): hand both fans back first, and refuse to
- * sleep if that fails. After resume the selected modes apply again.
+ * sleep if that fails. The selected modes apply again RESUME_SETTLE_JIFFIES
+ * after resume, once the EC has its state back.
  */
 static int mec_suspend(struct device *dev)
 {
@@ -2015,7 +2116,7 @@ static int mec_resume(struct device *dev)
 
 	scoped_guard(mutex, &d->lock)
 		d->suspended = false;
-	mod_delayed_work(system_dfl_wq, &d->monitor, 0);
+	mod_delayed_work(system_dfl_wq, &d->monitor, RESUME_SETTLE_JIFFIES);
 	return 0;
 }
 

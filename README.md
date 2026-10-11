@@ -34,15 +34,19 @@ The firmware and the module decide on the same temperature (EC CPU or EC system)
 | Firmware | stopped | 2000 | 2000 | 2000 | maximum |
 | Driver | stopped | 1000 | 1600 | firmware | firmware |
 
-- **Going down:** a step is left only 3 °C below the temperature where it starts. For example, the CPU fan
+- **Going down:** a step is left only 4 °C below the temperature where it starts. For example, the CPU fan
   returns to the driver at 62 °C.
 - **Stepping:** the speed changes one code at a time, at most once every 4 s. Jumps make the EC's speed loop hunt.
+  A stopped fan restarts at 2000 RPM and steps down from there; below 600 RPM (CPU) or 800 RPM (system) it stops.
 - **Fixed limits:** whatever the curve says, the CPU fan goes to the firmware at 80 °C and the system fan at 55 °C.
-  The firmware's critical row (maximum from 93–94 °C) is never touched.
-- **Refused values:** 100–599 RPM for the CPU fan and 100–799 RPM for the system fan. These speeds make the fan
-  hunt.
-- **Firmware CPU values:** these are the bases of the BIOS-selected Balance table, without the effect of its
-  slopes.
+  The firmware's critical row (maximum from 93 °C) is never touched.
+- **Refused values:** 1–549 RPM for the CPU fan and 1–749 RPM for the system fan; other values are rounded to the
+  nearest 100 (550 runs at 600). These speeds make the fan hunt or would round to a stop.
+- **Hunting:** if the speed still swings by more than 600 RPM at a steady target, the fan goes to the firmware for
+  60 s. After 3 times within 30 min, or 3 failed attempts to take control, it stays with the firmware
+  (`pwmN_enable` reads `3`) until `pwmN_enable` is written again.
+- **Firmware CPU values:** these are the bases of the BIOS-selected Balance table (Default is identical),
+  without the effect of its slopes. The Performance table is faster; the table in use is logged at load.
 - **Firmware system value:** 2000 RPM is measured; the table stored in the EC says 1500.
 
 ## Configuration
@@ -60,15 +64,17 @@ Each fan's mode (`pwm1` = CPU, `pwm2` = system) is set in `/sys/class/hwmon/hwmo
 
 | `pwmN_enable` | Mode |
 |---|---|
-| `1` | fixed value written to `pwmN` (code 0..51); returns to the curve if not renewed within 30 s |
+| `1` | fixed value written to `pwmN`: 0–255, where each step of 5 is 100 RPM (0 or 28–255 for `pwm1`, 0 or 38–255 for `pwm2`); returns to the curve if not renewed within 30 s |
 | `2` | driver curve (default) |
 | `3` | firmware |
 
 ## Installation
 
+Requires Linux 6.17 or later.
+
 ```sh
-sudo apt install git dkms build-essential linux-headers-$(uname -r)
-git clone <repository-url> minisforum_ec
+sudo apt install git dkms build-essential lm-sensors linux-headers-$(uname -r)
+git clone https://github.com/mordilloSan/fan_control.git minisforum_ec
 cd minisforum_ec
 sudo dkms add ./module
 sudo dkms install minisforum-ec/0.3.0
@@ -85,7 +91,7 @@ sudo rm -r /usr/src/minisforum-ec-0.3.0
 ```
 
 The module loads automatically at boot on this board. Unloading it, suspend and shutdown all hand both fans back
-to the firmware.
+to the firmware. If a fan cannot be handed back, suspend and hibernation are refused.
 
 ### Secure Boot
 
