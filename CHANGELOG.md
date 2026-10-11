@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Versions follow
 [Semantic Versioning](https://semver.org/): patch for fixes, minor for behaviour changes such as default curves
 or limits, major for interface changes (module parameters, `pwmN`/`pwmN_enable` meaning).
 
+## [Unreleased]
+
+- README: install the latest release from a fixed download link (`releases/latest/download/minisforum-ec-dkms.deb`),
+  download to `/tmp`, and document the branch and release workflow.
+- CI: build `dev/**` branches; refuse a release tag that is not on `main`; publish the package also under the fixed
+  name `minisforum-ec-dkms.deb`.
+
 ## [1.0.0] - 2026-10-11
 
 First release.
