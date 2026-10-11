@@ -39,6 +39,8 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match dkms.conf version $V"
             exit 1
           fi
+          # The checkout belongs to another user inside the container
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "tag $GITHUB_REF_NAME is not on main; merge the dev branch first"
             exit 1
