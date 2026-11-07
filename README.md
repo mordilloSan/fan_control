@@ -49,7 +49,8 @@ The firmware and the module decide on the same temperature (EC CPU or EC system)
 
 - **Going down:** a step is left only 4 °C below the temperature where it starts. For example, the CPU fan
   returns to the driver at 62 °C.
-- **Stepping:** the speed changes one code at a time, at most once every 4 s. Jumps make the EC's speed loop hunt.
+- **Stepping:** the speed changes at most once every 4 s. Jumps make the EC's speed loop hunt, so one step is one
+  code by default; `step_max_codes` lets it grow with the gap to at most four codes for a load ramp.
   A stopped fan restarts at 2000 RPM and steps down from there; below 600 RPM (CPU, F7BSI), 1000 RPM (CPU, F7BSC)
   or 800 RPM (system) it stops.
 - **Fixed limits:** whatever the curve says, the CPU fan goes to the firmware at 80 °C and the system fan at 55 °C.
@@ -73,9 +74,14 @@ The firmware and the module decide on the same temperature (EC CPU or EC system)
 cat /sys/module/minisforum_ec/parameters/cpu_curve
 echo "0:0,25:1000,45:1400,54:1800,66:firmware" | sudo tee /sys/module/minisforum_ec/parameters/cpu_curve
 echo "0:0,25:1000,40:1600,50:firmware"         | sudo tee /sys/module/minisforum_ec/parameters/system_curve
+cat /sys/module/minisforum_ec/parameters/step_max_codes
+echo 4                                         | sudo tee /sys/module/minisforum_ec/parameters/step_max_codes
 ```
 
-To make it persistent, add `options minisforum_ec cpu_curve=... system_curve=...` to
+`step_max_codes` accepts 1–4. The default 1 steps one code per 4 s; 4 lets the step grow with the gap, up to
+four codes.
+
+To make it persistent, add `options minisforum_ec cpu_curve=... system_curve=... step_max_codes=4` to
 `/etc/modprobe.d/minisforum_ec.conf`.
 
 Each fan's mode (`pwm1` = CPU, `pwm2` = system) is set in `/sys/class/hwmon/hwmonN/`:

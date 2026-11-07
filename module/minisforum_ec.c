@@ -17,8 +17,9 @@
  * seven bases and slopes of the BIOS-selected CPU table, never its bands or
  * critical row. Every write checks its preconditions first and is read back.
  *
- * The driver moves a fan one code at a time, because a jump makes the EC's
- * speed loop hunt; a stopped fan restarts at SPINUP_CODE and steps down. It
+ * The driver moves a fan towards its goal in steps of one to four codes
+ * (step_max_codes), because a jump makes the EC's speed loop hunt; a stopped
+ * fan restarts at SPINUP_CODE and steps down. It
  * gives the fan back to the firmware at a curve's firmware point, in mode 3,
  * when its EC temperature reaches its limit or reads implausibly, when it
  * hunts, when the EC is not in the state it last wrote, when a write or the
@@ -107,7 +108,9 @@
 #define SYS_MIN_CODE		8	/* codes 1..7 made the system fan hunt (both boards) */
 #define SPINUP_CODE		20	/* a stopped fan restarts here and steps down */
 #define MONITOR_JIFFIES		(2 * HZ)
-#define STEP_JIFFIES		(4 * HZ)	/* at most one code per step */
+#define STEP_JIFFIES		(4 * HZ)	/* at most one step per interval */
+#define STEP_MAX_CODES		4	/* a large gap steps this many codes */
+#define STEP_GAP_CODES		4	/* a gap of this many codes still steps one */
 #define HUNT_WINDOW		6	/* monitor samples looked at for hunting */
 #define HUNT_SPREAD		600	/* RPM swing over that window that counts as hunting */
 #define HUNT_BACKOFF		(60 * HZ)
@@ -723,6 +726,11 @@ MODULE_PARM_DESC(cpu_curve,
 module_param_cb(system_curve, &curve_ops, &curve_params[FAN_SYS], 0644);
 MODULE_PARM_DESC(system_curve,
 		 "System fan curve on the EC system temperature, default \"0:0,25:1000,40:1600,50:firmware\"; empty leaves the fan to the firmware; rpm 0 or 800..5100");
+
+static int step_max_codes = 1;
+module_param(step_max_codes, int, 0644);
+MODULE_PARM_DESC(step_max_codes,
+		 "maximum fan codes per step (1..4); 1 steps one code, 4 follows load ramps");
 
 struct mec_data;
 struct fan;
@@ -1512,17 +1520,24 @@ static int fan_set(struct mec_data *d, struct fan *f, int code)
 }
 
 /*
- * One code at a time towards the goal: a jump makes the EC's speed loop hunt.
- * Codes 1..min_code-1 are skipped; a stopped fan restarts at SPINUP_CODE and
- * steps from there towards the goal.
+ * Step towards the goal. A jump makes the EC's speed loop hunt, but one code
+ * per step cannot follow a load ramp either. step_max_codes caps the step:
+ * 1 keeps the one-code behaviour, 4 lets the step grow with the gap. Codes
+ * 1..min_code-1 are skipped; a stopped fan restarts at SPINUP_CODE and steps
+ * from there towards the goal.
  */
 static int fan_next_code(const struct fan *f, int goal)
 {
-	int next;
+	int gap, step, max_codes, next;
 
 	if (f->cur == 0)
 		return SPINUP_CODE;
-	next = f->cur + (goal > f->cur ? 1 : -1);
+	max_codes = clamp(step_max_codes, 1, STEP_MAX_CODES);
+	gap = goal > f->cur ? goal - f->cur : f->cur - goal;
+	step = clamp(DIV_ROUND_UP(gap, STEP_GAP_CODES), 1, max_codes);
+	next = goal > f->cur ? f->cur + step : f->cur - step;
+	if ((goal > f->cur && next > goal) || (goal < f->cur && next < goal))
+		next = goal;
 	if (next > 0 && next < f->min_code)
 		next = goal > f->cur ? f->min_code : 0;
 	return next;
