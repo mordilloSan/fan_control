@@ -6,9 +6,8 @@ or limits, major for interface changes (module parameters, `pwmN`/`pwmN_enable` 
 
 ## [Unreleased]
 
-- `step_max_codes` module parameter: cap the fan step at 1–4 codes per 4 s. The default 1 keeps one code per step;
-  4 lets the step grow with the gap, so the fan follows a load ramp instead of falling behind until the temperature
-  limit hands it to the firmware.
+- The fan step grows with the gap to the target, up to four codes per 4 s, so the fan follows a load ramp instead
+  of falling behind until the temperature limit hands it to the firmware.
 
 ## [1.2.0] - 2026-11-06
 
